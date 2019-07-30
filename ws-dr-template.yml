@@ -1,0 +1,311 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This CloudFormation template creates a multi-region Disaster Recovery environment for Amazon WorkSpaces.'
+
+# Template Parameters
+Parameters:
+
+# S3 bucket unique name
+  UsersBucketName:
+    Type: String
+    Description: 'The name of S3 bucket to used store the user files for DR. Must be an unique name. (ie: ws-dr-bucket-080119)'
+
+# Domain Controller or member server instance ID
+  AdInstanceID:
+    Type: String
+    Description: 'The EC2 Instance ID of the Domain Controller or Member Server the DR region. (ie: i-012a3b4c567d8e901)'
+
+# OU path for WorkSpaces users
+  UsersOU:
+    Type: String
+    Description: 'The WorkSpaces users OU path. (ie: OU=users,OU=workspaces,DC=domain,DC=com)'
+
+# AD Connector or Microsoft AD directory ID
+  DirectoryID:
+    Type: String
+    Description: 'The ID of the AWS Directory Services object (ie: d-01234a567b).'
+
+# WorkSpaces bundle ID
+  BundleID:
+    Type: String
+    Description: 'The ID of the Amazon WorkSpaces Bundle in the DR region (ie: wsb-abc0defgh).'
+
+# Windows drive for PS1 script to create files
+  DriveLetter:
+    Type: String
+    Description: 'The letter of the drive where you want workspaces-users.csv file to be exported in the Domain Controller or Member Server. (ie: D)'
+
+Resources:
+
+# Create S3 bucket in DR region
+  UsersBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref UsersBucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Event: 's3:ObjectCreated:Put'
+          Function: !GetAtt LambdaCompare.Arn
+          Filter:
+            S3Key:
+              Rules:
+                -
+                  Name: suffix
+                  Value: .csv
+    DependsOn:
+      - LambdaComparePermission
+
+# Create maintenance window role
+  MaintenanceWindowRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: 'ws-dr-maintenance-window-role'
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - ssm.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AmazonSSMMaintenanceWindowRole
+        Policies:
+          - PolicyName: pass-role
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - iam:PassRole
+                  Resource:
+                    - '*'
+
+# Create maintenance window
+  MaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: 'ws-dr-maintenance-window'
+      Schedule: 'cron(0 */10 * ? * *)'
+      Duration: 3
+      Cutoff: 1
+      AllowUnassociatedTargets: true
+    DependsOn:
+      - MaintenanceWindowRole
+      - UsersBucket
+
+# Create maintenance window task
+  MaintenanceWindowTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Properties:
+      Name: 'ws-dr-maintenance-window-task'
+      WindowId: !Sub '${MaintenanceWindow}'
+      Targets:
+        - Key: InstanceIds
+          Values:
+          - !Ref AdInstanceID
+      TaskType: 'RUN_COMMAND'
+      ServiceRoleArn: !GetAtt MaintenanceWindowRole.Arn
+      TaskArn: 'AWS-RunPowerShellScript'
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          Parameters:
+            commands: 
+            - !Sub "New-Item -Path ${DriveLetter}:\\workspaces-users -ItemType directory\nGet-ADUser -Filter * -SearchBase '${UsersOU}' -Properties SamAccountname | % {New-Object PSObject -Property @{oSamAccountname= $_.SamAccountname}} | Select oSamAccountname | export-CSV ${DriveLetter}:\\workspaces-users\\workspaces-users1.csv -NoTypeInformation -Encoding UTF8\nGet-Content ${DriveLetter}:\\workspaces-users\\workspaces-users1.csv | select -Skip 1 | Set-Content ${DriveLetter}:\\workspaces-users\\workspaces-users.csv\nWrite-S3Object -BucketName ${UsersBucketName} -File ${DriveLetter}:\\workspaces-users\\workspaces-users.csv"
+            workingDirectory: 
+            - ""
+            executionTimeout: 
+            - "3600"
+      MaxConcurrency: 1
+      MaxErrors: 1
+      Priority: 10
+    DependsOn:
+      - MaintenanceWindow
+
+# Create role for Lambda compare function
+  LambdaCompareRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'ws-dr-lambda-compare-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Principal:
+              Service: 
+                - 'lambda.amazonaws.com'
+            Action: 
+              - 'sts:AssumeRole'
+
+# Create policy and attaches to the role for Lambda compare function              
+  LambdaCompareRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: 'ws-dr-lambda-compare-role-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: 'Allow'
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              - 'workspaces:CreateWorkspaces'
+              - 'workspaces:TerminateWorkspaces'
+              - 'workspaces:DescribeWorkspaces'
+            Resource: '*'
+          -
+            Effect: 'Allow'
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+            Resource: !Sub '${UsersBucket.Arn}/*'
+      Roles:
+        - !Ref LambdaCompareRole
+
+# Create Lambda compare function
+  LambdaCompare:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'ws-dr-lambda-compare'
+      Handler: 'index.lambda_handler'
+      Role: !Sub '${LambdaCompareRole.Arn}'
+      Code:
+        ZipFile:
+          "Fn::Sub": |
+            import csv
+            import logging
+            import os
+            import boto3
+
+            s3_client = boto3.client('s3')
+            ws_client = boto3.client('workspaces')
+            DIRECTORY_ID = os.getenv('DIRECTORY_ID')
+            BUNDLE_ID = os.getenv('BUNDLE_ID',)
+            RUNNING_MODE = 'AUTO_STOP'
+            logging.basicConfig(format='%(asctime)s [%(levelname)+8s]%(module)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+            logger = logging.getLogger(__name__)
+            logger.setLevel(getattr(logging, os.getenv('LOG_LEVEL', 'INFO')))
+
+            # --- Main handler ---
+
+            def lambda_handler(event, context):
+                bucket = event['Records'][0]['s3']['bucket']['name']
+                key = event['Records'][0]['s3']['object']['key']
+
+                # Get CSV file from S3 and transform it into JSON
+                csv_object = s3_client.get_object(Bucket=bucket, Key=key)
+                csv_users = csv.reader(csv_object['Body'].read().decode('utf-8').splitlines())
+                ad_users = set()
+                for item in csv_users:
+                    if item:
+                        logger.debug('Adding user: {}'.format(item[0]))
+                        ad_users.add(item[0])
+
+                # Get current workspaces
+                response = ws_client.describe_workspaces()
+                workspaces = response['Workspaces']
+                current_ws = set()
+                for workspace in workspaces:
+                    current_ws.add(workspace['UserName'])
+
+                # If user is present in Ad user list but not in WorkSpaces list, terminate WorkSpace
+                users_to_add = ad_users - current_ws
+                logger.debug('Users to add: {}'.format(users_to_add))
+                for user in users_to_add:
+                    try:
+                        logger.info('Creating Workspaces for user: {}'.format(user))
+                        create_ws = ws_client.create_workspaces(
+                            Workspaces=[
+                                {
+                                    'DirectoryId': DIRECTORY_ID,
+                                    'UserName': user,
+                                    'BundleId': BUNDLE_ID,
+                                    'WorkspaceProperties': {
+                                        'RunningMode': RUNNING_MODE,
+                                        'RunningModeAutoStopTimeoutInMinutes': 60
+                                    }
+                                }
+                            ]
+                        )
+                    except Exception as e:
+                        logger.error('Unable to Create Workspaces')
+                        logger.debug('Error: {}'.format(e))
+
+                # If user is present in WorkSpaces list but not in AD user list, terminate WorkSpace
+                ws_to_terminate = current_ws - ad_users
+                logger.debug('Workspaces to terminate: {}'.format(ws_to_terminate))
+                for user in ws_to_terminate:
+                    try:
+                        logger.info('Terminating Workspaces for user: {}'.format(user))
+                        describe_ws = ws_client.describe_workspaces(
+                            DirectoryId=DIRECTORY_ID,
+                            UserName=user
+                        )
+
+                        workspace_id = describe_ws['Workspaces'][0]['WorkspaceId']
+
+                        terminate_ws = ws_client.terminate_workspaces(
+                            TerminateWorkspaceRequests=[
+                                {
+                                    'WorkspaceId': workspace_id
+                                },
+                            ])
+                    except Exception as e:
+                        logger.error('Error executing describe_workspaces or terminate_workspaces')
+                        logger.debug('Error: {}'.format(e))
+
+      Runtime: 'python2.7'
+      Timeout: 600
+      Environment:
+        Variables:
+          DIRECTORY_ID: !Ref DirectoryID
+          BUNDLE_ID: !Ref BundleID
+
+# Creates the Lambda Compare function permission for the S3 bucket
+  LambdaComparePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaCompare
+      Action: 'lambda:InvokeFunction'
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${UsersBucketName}'
+
+# Resource Outputs
+Outputs:
+
+  StackName:
+    Description: Stack name.
+    Value: !Sub '${AWS::StackName}'
+
+  UsersBucket:
+    Description: S3 bucket name.
+    Value: !Ref UsersBucket
+
+  MaintenanceWindowRole:
+    Description: Maintenance Window Role name.
+    Value: !Ref MaintenanceWindowRole
+
+  MaintenanceWindow:
+    Description: Systems Manager Maintenance Window ID.
+    Value: !Ref MaintenanceWindow
+
+  MaintenanceWindowTask:
+    Description: Maintenance Window Task ID.
+    Value: !Ref MaintenanceWindowTask
+
+  LambdaCompareRole:
+    Description: Lambda Compare Role name.
+    Value: !Ref LambdaCompareRole
+
+  LambdaCompareRolePolicy:
+    Description: Lambda Compare Policy ID.
+    Value: !Ref LambdaCompareRolePolicy
+
+  LambdaCompare:
+    Description: Lambda Compare function name.
+    Value: !Ref LambdaCompare
