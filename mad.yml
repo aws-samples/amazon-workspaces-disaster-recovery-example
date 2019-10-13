@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'This CloudFormation template creates a Managed AD domain and an EC2 instance joined to that domain.'
+
+# Template Parameters
+Parameters:
+
+# The alias of the MAD resource
+  DsMadAlias:
+    Type: String
+    Default: 'exampledomain'
+    Description: 'The alias of the MAD resource. (ie: exampledomain)'
+
+# The edition of the MAD resource.
+  DsMadEdition:
+    Type: String
+    Default: 'Standard'
+    Description: 'The edition of the MAD resource. (ie: Enterprise or Standard)'
+
+# The name of the MAD resource
+  DsMadName:
+    Type: String
+    Default: 'exampledomain.com'
+    Description: 'The name of the MAD resource. (ie: exampledomain.com)'
+
+# The password of the MAD resource
+  DsMadPwd:
+    Type: String
+    Default: 'Aws4Ev3r'
+    Description: 'The password of the MAD resource (ie: Aws4Ev3r).'
+
+# The VPC ID for the MAD resource
+  DsMadVpcIds:
+    Type: 'AWS::EC2::VPC::Id'
+    Default: 'vpc-0ea2f8032ad17debd'
+    Description: 'The VPC ID for the MAD resource (ie: vpc-0ea2f8032ad17debd).'
+
+# The VPC subnet 1 ID for the MAD resource
+  DsMadSubnetIds1:
+    Type: 'AWS::EC2::Subnet::Id'
+    Default: 'subnet-03c8d30014166c072'
+    Description: 'The VPC subnet 1 settings for the MAD resource (ie: subnet-03c8d30014166c072).'
+
+# The VPC subnet 2 ID for the MAD resource
+  DsMadSubnetIds2:
+    Type: 'AWS::EC2::Subnet::Id'
+    Default: 'subnet-0d4d2b8661c8038aa'
+    Description: 'The VPC subnet 2 settings for the MAD resource (ie: subnet-0d4d2b8661c8038aa).'
+
+Resources:
+
+# Create S3 bucket in DR region
+  DsMad:
+    Type: 'AWS::DirectoryService::MicrosoftAD'
+    Properties:
+      Edition:
+        Ref: DsMadEdition
+      Name: 
+        Ref: DsMadName
+      Password: 
+        Ref: DsMadPwd
+      VpcSettings:
+        VpcId: 
+          Ref: DsMadVpcIds
+        SubnetIds: 
+          - Ref: DsMadSubnetIds1
+          - Ref: DsMadSubnetIds2
+
+# Resource Outputs
+Outputs:
+
+  StackName:
+    Description: Stack name.
+    Value: !Sub '${AWS::StackName}'
+
+  DsMad:
+    Description: Managed AD info.
+    Value: !Ref DsMad
