@@ -212,7 +212,7 @@ Resources:
                 for workspace in workspaces:
                     current_ws.add(workspace['UserName'])
 
-                # If user is present in Ad user list but not in WorkSpaces list, terminate WorkSpace
+                # If user is present in Ad user list but not in WorkSpaces list, create WorkSpace
                 users_to_add = ad_users - current_ws
                 logger.debug('Users to add: {}'.format(users_to_add))
                 for user in users_to_add:
@@ -241,14 +241,11 @@ Resources:
                 for user in ws_to_terminate:
                     try:
                         logger.info('Terminating Workspaces for user: {}'.format(user))
-                        describe_ws = ws_client.describe_workspaces(
-                            DirectoryId=DIRECTORY_ID,
-                            UserName=user
-                        )
-
-                        workspace_id = describe_ws['Workspaces'][0]['WorkspaceId']
-
-                        terminate_ws = ws_client.terminate_workspaces(
+                        describe_ws = ws_client.describe_workspaces(DirectoryId=DIRECTORY_ID)
+                        for workspace in describe_ws['Workspaces']:
+                            if workspace['UserName'] == user:
+                                workspace_id = workspace['WorkspaceId']
+                                terminate_ws = ws_client.terminate_workspaces(
                             TerminateWorkspaceRequests=[
                                 {
                                     'WorkspaceId': workspace_id
@@ -258,7 +255,7 @@ Resources:
                         logger.error('Error executing describe_workspaces or terminate_workspaces')
                         logger.debug('Error: {}'.format(e))
 
-      Runtime: 'python2.7'
+      Runtime: 'python3.9'
       Timeout: 600
       Environment:
         Variables:
